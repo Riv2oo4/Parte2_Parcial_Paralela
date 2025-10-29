@@ -1,0 +1,1 @@
+//   g++ -O2 -std=c++17 metricas_supermercado.cpp -o metricas_supermercado.exe -luser32 -lkernel32
