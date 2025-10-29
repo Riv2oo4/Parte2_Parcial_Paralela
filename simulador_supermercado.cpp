@@ -6,6 +6,9 @@
 #include <chrono>
 #include <iomanip>
 #include <algorithm>
+#include <mutex>
+#include <omp.h>
+#include <memory>
 
 using namespace std;
 using namespace std::chrono;
@@ -29,13 +32,22 @@ struct Cliente {
     int cantidadProductos;
 };
 
+struct ThreadStats {
+    double ventasTotales = 0.0;
+    int productosVendidos = 0;
+    int pagosEfectivo = 0;
+    int pagosTarjeta = 0;
+};
+
 // Clase principal del simulador
 class SimuladorSupermercado {
 private:
     map<int, Producto> inventario;
     vector<Cliente> clientes;
     mt19937 gen;
-    
+    vector<unique_ptr<mutex>> productLocks;
+
+
     // Estadísticas globales
     double ventasTotales = 0;
     int productosVendidos = 0;
@@ -123,6 +135,13 @@ public:
             p.vendidos = 0;
             inventario[i] = p;
         }
+        productLocks.clear();
+        productLocks.reserve(inventario.size());        // ok porque unique_ptr es movible
+        for (size_t i = 0; i < inventario.size(); ++i)
+            productLocks.emplace_back(std::make_unique<std::mutex>());
+
+
+
     }
     
     Cliente simularCliente(int id) {
@@ -227,6 +246,90 @@ public:
         
         return cliente;
     }
+
+    Cliente simularCliente_parallel(int id, ThreadStats& ts, int threadId) {
+        static thread_local mt19937 genThread( (unsigned)hash<string>{}(
+            to_string(chrono::high_resolution_clock::now().time_since_epoch().count())
+            + "|" + to_string(threadId))
+        );
+
+        Cliente cliente;
+        cliente.id = id;
+        cliente.total = 0;
+        cliente.cantidadProductos = 0;
+
+        auto inicio = high_resolution_clock::now();
+
+        uniform_real_distribution<> probDist(0, 1);
+        double tipoComprador = probDist(genThread);
+
+        int minProductos, maxProductos;
+        double probProductoCaro;
+
+        if (tipoComprador < 0.20) { minProductos = 1;  maxProductos = 5;  probProductoCaro = 0.1; }
+        else if (tipoComprador < 0.60) { minProductos = 5;  maxProductos = 15; probProductoCaro = 0.3; }
+        else if (tipoComprador < 0.85) { minProductos = 15; maxProductos = 30; probProductoCaro = 0.4; }
+        else { minProductos = 30; maxProductos = 50; probProductoCaro = 0.5; }
+
+        uniform_int_distribution<> cantDist(minProductos, maxProductos);
+        int productosAComprar = cantDist(genThread);
+
+        uniform_int_distribution<> prodDist(0, (int)inventario.size() - 1);
+        uniform_int_distribution<> cantidadDist(1, 3);
+
+        for (int i = 0; i < productosAComprar; i++) {
+            bool elegirCaro = probDist(genThread) < probProductoCaro;
+
+            int intentos = 0, idProducto;
+            do {
+                idProducto = prodDist(genThread);
+                intentos++;
+            } while (intentos < 10 &&
+                    ((elegirCaro && inventario[idProducto].precio <= 5.00) ||
+                    (!elegirCaro && inventario[idProducto].precio > 5.00)));
+
+            {
+                lock_guard<mutex> g(*productLocks[idProducto]);
+                if (inventario[idProducto].stock > 0) {
+                    int cantidad = cantidadDist(genThread);
+                    cantidad = min(cantidad, inventario[idProducto].stock);
+
+                    cliente.carrito.push_back({ &inventario[idProducto], cantidad });
+
+                    cliente.total += inventario[idProducto].precio * cantidad;
+                    cliente.cantidadProductos += cantidad;
+
+                    inventario[idProducto].stock   -= cantidad;
+                    inventario[idProducto].vendidos += cantidad;
+                }
+            }
+        }
+
+        uniform_real_distribution<> tiempoPagoDist(30, 120);
+        double tiempoPago = tiempoPagoDist(genThread);
+
+        if (probDist(genThread) < 0.7) {
+            cliente.metodoPago = "Tarjeta";
+            tiempoPago *= 0.8;
+            ts.pagosTarjeta++;
+        } else {
+            cliente.metodoPago = "Efectivo";
+            ts.pagosEfectivo++;
+        }
+
+        auto fin = high_resolution_clock::now();
+        (void)inicio; (void)fin;
+
+        uniform_real_distribution<> tiempoSeleccionDist(180, 600);
+        cliente.tiempoCompra = tiempoSeleccionDist(genThread) + tiempoPago;
+
+        // acumular al hilo
+        ts.ventasTotales     += cliente.total;
+        ts.productosVendidos += cliente.cantidadProductos;
+
+        return cliente;
+    }
+
     
     void ejecutarSimulacion(int numClientes) {
         cout << "\n=== INICIANDO SIMULACIÓN DE SUPERMERCADO ===" << endl;
@@ -251,6 +354,57 @@ public:
         cout << "\nSimulación completada en " << fixed << setprecision(2) 
              << duracionTotal.count() << " segundos" << endl;
     }
+    void ejecutarSimulacionOMP(int numClientes, int numThreads = 0) {
+        if (numThreads <= 0) numThreads = omp_get_max_threads();
+
+        cout << "\n=== INICIANDO SIMULACIÓN (OpenMP) ===" << endl;
+        cout << "Hilos: " << numThreads << " | Clientes: " << numClientes << endl;
+        cout << "----------------------------------------" << endl;
+
+        auto inicioSimulacion = high_resolution_clock::now();
+
+        clientes.clear();
+        clientes.resize(numClientes);
+
+        double ventasTotales_local = 0.0;
+        int productosVendidos_local = 0;
+        int pagosEfectivo_local = 0;
+        int pagosTarjeta_local = 0;
+
+        #pragma omp parallel num_threads(numThreads)
+        {
+            int tid = omp_get_thread_num();
+            ThreadStats ts;
+
+            #pragma omp for schedule(static)
+            for (int i = 1; i <= numClientes; i++) {
+                Cliente c = simularCliente_parallel(i, ts, tid);
+                clientes[i-1] = std::move(c);
+            }
+
+            #pragma omp atomic
+            ventasTotales_local += ts.ventasTotales;
+            #pragma omp atomic
+            productosVendidos_local += ts.productosVendidos;
+            #pragma omp atomic
+            pagosEfectivo_local += ts.pagosEfectivo;
+            #pragma omp atomic
+            pagosTarjeta_local += ts.pagosTarjeta;
+        }
+
+        auto finSimulacion = high_resolution_clock::now();
+        duration<double> duracionTotal = finSimulacion - inicioSimulacion;
+
+        // Volcar a los miembros globales de la clase
+        ventasTotales     += ventasTotales_local;
+        productosVendidos += productosVendidos_local;
+        pagosEfectivo     += pagosEfectivo_local;
+        pagosTarjeta      += pagosTarjeta_local;
+
+        cout << "\nSimulación completada en " << fixed << setprecision(2)
+            << duracionTotal.count() << " segundos" << endl;
+    }
+
     
     void mostrarEstadisticas() {
         cout << "\n\n========================================" << endl;
@@ -382,7 +536,19 @@ int main() {
     }
     
     // Ejecutar simulación
-    simulador.ejecutarSimulacion(numClientes);
+    int modo;
+    cout << "\nModo de simulación: 1) Secuencial  2) Paralela (OpenMP)\n";
+    cout << "Ingrese 1 o 2: ";
+    cin >> modo;
+
+    if (modo == 2) {
+        int hilos;
+        cout << "¿Cuántos hilos? (0 = max del sistema): ";
+        cin >> hilos;
+        simulador.ejecutarSimulacionOMP(numClientes, hilos);
+    } else {
+        simulador.ejecutarSimulacion(numClientes); // tu versión original
+    }
     
     // Mostrar resultados
     simulador.mostrarEstadisticas();
